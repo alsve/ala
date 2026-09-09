@@ -16,7 +16,7 @@ func NewAMQPConnectionManager(l logger.Logger, amqpURI string, opt ...Option) *A
 		amqpURI:         amqpURI,
 		reconnectSignal: make(chan *amqp.Error, 1),
 		tpReconnSignal:  make([]chan *amqp.Connection, 0, 10),
-		routineCloser:   make(chan struct{}),
+		routineCloser:   make(chan struct{}, 1),
 		cond:            sync.NewCond(&sync.Mutex{}),
 		autoReconnect:   true,
 	}
@@ -39,7 +39,8 @@ type AMQPConnectionManager struct {
 
 	reconnectSignal chan *amqp.Error        // reconnectSignal holds notifier channel when connection closed.
 	tpReconnSignal  []chan *amqp.Connection // tpReconnSignal signal third party for reconnection.
-	routineCloser   chan struct{}           // routineCloser holds channel for signal close connection monitor routine.
+	routineCloser   chan struct{}           // routineCloser holds signal for close connection monitor routine.
+	closing         bool                    // closing marks the manager as shut down; Connect stops waiting.
 
 	autoReconnect bool // autoReconect sets whether connection manager should auto reconnect or not.
 
@@ -75,7 +76,20 @@ func (a *AMQPConnectionManager) startConnectionMonitorRoutine() {
 					break
 				}
 				a.log.Error("AMQPConnectionManager.startConnectionMonitorRoutine: dial failed: %s; retrying in %s", err.Error(), backoff)
-				time.Sleep(backoff)
+
+				// FIX(close-hang): the retry loop used to sleep unconditionally,
+				// so Close() blocked forever on the unbuffered routineCloser send
+				// whenever the broker was unreachable. Abort the reconnect on
+				// close signal instead.
+				select {
+				case <-a.routineCloser:
+					a.cond.L.Lock()
+					a.closing = true
+					a.cond.Broadcast()
+					a.cond.L.Unlock()
+					return
+				case <-time.After(backoff):
+				}
 				if backoff < 30*time.Second {
 					backoff *= 2
 				}
@@ -141,6 +155,10 @@ func (a *AMQPConnectionManager) Connect() *amqp.Connection {
 	defer a.cond.L.Unlock()
 
 	for a.conn == nil {
+		if a.closing {
+			return nil
+		}
+
 		select {
 		case a.reconnectSignal <- nil:
 		default:
@@ -167,6 +185,9 @@ func (a *AMQPConnectionManager) RenewAMQPChannel() (*amqp.Channel, error) {
 
 // Close close all connection gracefully.
 func (a *AMQPConnectionManager) Close() error {
+	// FIX(close-blocking): routineCloser used to be unbuffered, so Close
+	// blocked forever when the monitor routine was stuck dialing a dead
+	// broker. The buffer size of 1 makes the close signal non-blocking.
 	a.routineCloser <- struct{}{}
 
 	for _, ch := range a.tpReconnSignal {
@@ -174,6 +195,19 @@ func (a *AMQPConnectionManager) Close() error {
 	}
 
 	a.tpReconnSignal = nil
-	err := a.conn.Close()
+
+	// FIX(nil-conn): dialing may never have succeeded, in which case conn is
+	// nil and a.conn.Close() would panic with a nil pointer dereference.
+	a.cond.L.Lock()
+	conn := a.conn
+	a.closing = true
+	a.cond.Broadcast()
+	a.cond.L.Unlock()
+
+	if conn == nil {
+		return nil
+	}
+
+	err := conn.Close()
 	return err
 }

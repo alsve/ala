@@ -1,10 +1,10 @@
 package alaserv
 
 import (
-	"time"
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	uuid "github.com/satori/go.uuid"
 	"github.com/streadway/amqp"
@@ -45,6 +45,11 @@ func New(amqpURI string) *AlaServer {
 	as := &AlaServer{
 		amqpURI:           amqpURI,
 		routeCloseSignals: newCanceler(),
+
+		// cmrCloser coalesces close requests for the reconcile loop. Without a
+		// buffered channel every send falls to the select default and Close()
+		// could never actually stop the loop.
+		cmrCloser: make(chan struct{}, 1),
 
 		// FIX(nil-ctx): handler goroutines spawn contexts from a.ctx; it must
 		// never be nil, otherwise any delivery handled before Start() sets it
@@ -415,6 +420,18 @@ func (a *AlaServer) Start(ctx context.Context) {
 	a.closeSignal = cancel
 
 	if a.conn == nil {
+		// Prefer the Connector's connection: dialing a second connection here
+		// leaks it, because reconcile() replaces a.conn with the Connector's
+		// connection right after startup, leaving the dialed one orphaned
+		// (one idle AMQP connection per Start/reload on the broker).
+		if a.c != nil {
+			if pulled := a.c.Connect(); pulled != nil {
+				a.conn = pulled
+			}
+		}
+	}
+
+	if a.conn == nil {
 		// Fail fast on unrecoverable configuration errors (bad URI, wrong
 		// credentials), but tolerate a broker that is merely not up yet:
 		// retry a few times before treating it as fatal.
@@ -448,11 +465,25 @@ func (a *AlaServer) Close() error {
 	a.ready.Lock()
 	a.stopping = true
 	closeSignal := a.closeSignal
+	publishCh := a.amqpChan
+	consumeCh := a.amqpChanConsume
 	conn := a.conn
 	a.ready.Unlock()
 
 	if closeSignal != nil {
 		defer closeSignal()
+	}
+
+	// Close the server's own channels so every consumer registered on them
+	// is unregistered on the broker immediately. The connection itself is
+	// owned by the Connector (when set) and closed by its owner; without
+	// this, consumers of a previous session survive Close and keep receiving
+	// deliveries that nobody processes anymore.
+	if consumeCh != nil {
+		_ = consumeCh.Close()
+	}
+	if publishCh != nil {
+		_ = publishCh.Close()
 	}
 
 	a.routeCloseSignals.CancelAll()
