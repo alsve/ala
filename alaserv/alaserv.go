@@ -1,6 +1,7 @@
 package alaserv
 
 import (
+	"time"
 	"context"
 	"fmt"
 	"log"
@@ -44,7 +45,18 @@ func New(amqpURI string) *AlaServer {
 	as := &AlaServer{
 		amqpURI:           amqpURI,
 		routeCloseSignals: newCanceler(),
+
+		// FIX(nil-ctx): handler goroutines spawn contexts from a.ctx; it must
+		// never be nil, otherwise any delivery handled before Start() sets it
+		// panics with "cannot create context from nil parent" and crashes the
+		// whole process (observed whenever a queue had a backlog at startup).
+		ctx: context.Background(),
+
+		// reconcileCh coalesces recovery triggers (connection close, consume
+		// channel close, reconnect push) into serialized reconcile passes.
+		reconcileCh: make(chan struct{}, 1),
 	}
+	go as.reconcileLoop()
 
 	return as
 }
@@ -71,7 +83,38 @@ type AlaServer struct {
 	ready spinlock.Locker
 
 	// nConsumePrefetch is consume prefetch count.
+	// FIX(unbounded-prefetch): previously always 0 (unlimited), so the broker
+	// delivered the whole queue at once and every delivery stayed unacked
+	// until its handler finished. With RabbitMQ >= 3.8.15 the default
+	// consumer_timeout (30 min) then CLOSES the consume channel and ala never
+	// noticed: consumers silently disappeared. SetPrefetch bounds it.
 	nConsumePrefetch int
+
+	// reconcileCh coalesces recovery triggers; reconcileLoop serializes them.
+	reconcileCh chan struct{}
+
+	// registeredConn/routesRegistered track whether consumers are live on
+	// the current connection+channel pair, so reconcile() never registers
+	// duplicate consumers.
+	registeredConn   *amqp.Connection
+	routesRegistered bool
+	consumeGen       int
+	publishHealthy   bool
+	consumeHealthy   bool
+
+	// stopping guards Close() vs reconcile races.
+	stopping bool
+}
+
+// SetPrefetch sets the consumer prefetch count (Qos) applied on every
+// (re)registered consume channel. A non-zero value bounds the number of
+// unacknowledged deliveries per consumer, which keeps the broker's
+// delivery-acknowledgement (consumer_timeout) watchdog happy and stops
+// unbounded unacked pile-ups. Call before Start.
+func (a *AlaServer) SetPrefetch(n int) {
+	a.ready.Lock()
+	defer a.ready.Unlock()
+	a.nConsumePrefetch = n
 }
 
 // SetReplyer sets replyer for connecting queue to listener.
@@ -109,7 +152,6 @@ func (a *AlaServer) SetReconnectSignal(c ReconnectSignaler) {
 	a.reconnectSignal = c.ReconnectSignal()
 
 	a.closeConnectionMonitorRoutine()
-	go a.startConnectionMonitorRoutine()
 }
 
 // closeConnectionMonitorRoutine closes connection monitor routine.
@@ -120,34 +162,162 @@ func (a *AlaServer) closeConnectionMonitorRoutine() {
 	}
 }
 
-// startConnectionMonitorRoutine
-func (a *AlaServer) startConnectionMonitorRoutine() {
+// reconcileLoop serializes all recovery triggers: reconnect pushes from the
+// Connector, connection closes, and consume-channel closes.
+func (a *AlaServer) reconcileLoop() {
 	for {
 		select {
 		case <-a.cmrCloser:
 			return
 		case conn := <-a.reconnectSignal:
-			a.ready.Lock()
-			a.routeCloseSignals.CancelAll()
-			a.conn = conn
-
-			amqpChan, err := conn.Channel()
-			if err != nil {
-				log.Printf("Failed to create channel: %s\n", err.Error())
-			}
-			a.amqpChan = amqpChan
-
-			amqpChanConsume, err := conn.Channel()
-			if err != nil {
-				log.Printf("Failed to create channel: %s\n", err.Error())
-			}
-			a.amqpChanConsume = amqpChanConsume
-			a.amqpChanConsume.Qos(a.nConsumePrefetch, 0, false)
-
-			a.startupServer()
-			a.ready.Unlock()
+			a.reconcile(conn)
+		case <-a.reconcileCh:
+			a.reconcile(nil)
 		}
 	}
+}
+
+// scheduleReconcile requests a reconcile pass, coalescing bursts.
+func (a *AlaServer) scheduleReconcile() {
+	select {
+	case a.reconcileCh <- struct{}{}:
+	default:
+	}
+}
+
+// reconcile (re)establishes channels and route registrations against the
+// freshest available connection. It is the single recovery path for:
+//   - Connector reconnect pushes,
+//   - the current connection dying (NotifyClose),
+//   - the consume channel being closed by the broker (e.g. consumer_timeout),
+//   - failed (re)registrations (retried with backoff).
+//
+// It must never panic: transient broker outages are expected, and a panic
+// takes down the whole service.
+func (a *AlaServer) reconcile(pushConn *amqp.Connection) {
+	a.ready.Lock()
+	defer a.ready.Unlock()
+
+	if a.stopping {
+		return
+	}
+
+	// Pull the freshest connection from the Connector when available. This
+	// compensates for reconnect notifications that were dropped by the
+	// Connector's non-blocking push.
+	conn := a.conn
+	if a.c != nil {
+		if pulled := a.c.Connect(); pulled != nil {
+			conn = pulled
+		}
+	}
+	if conn == nil {
+		conn = a.conn
+	}
+	if conn == nil {
+		log.Printf("alaserv: reconcile skipped, no connection available yet")
+		return
+	}
+
+	// Healthy fast-path: already registered on this connection with live
+	// channels. Without this, repeated triggers would stack duplicate
+	// consumers on the same queues.
+	if conn == a.registeredConn && a.publishHealthy && a.consumeHealthy {
+		return
+	}
+
+	// Publish channel: reuse when healthy, recreate otherwise.
+	if conn != a.conn || !a.publishHealthy {
+		if a.amqpChan != nil && a.publishHealthy {
+			_ = a.amqpChan.Close()
+		}
+		amqpChan, err := conn.Channel()
+		if err != nil {
+			log.Printf("alaserv: reconcile: failed to create publish channel: %s; retrying", err.Error())
+			a.scheduleReconcile()
+			return
+		}
+		a.amqpChan = amqpChan
+		a.publishHealthy = true
+	}
+
+	// Consume channel: recreate when unhealthy, which also forces
+	// re-registration of every route (consumers die with their channel).
+	if conn != a.conn || !a.consumeHealthy {
+		if a.amqpChanConsume != nil && a.consumeHealthy {
+			a.amqpChanConsume.Close()
+		}
+		amqpChanConsume, err := conn.Channel()
+		if err != nil {
+			log.Printf("alaserv: reconcile: failed to create consume channel: %s; retrying", err.Error())
+			a.scheduleReconcile()
+			return
+		}
+		a.amqpChanConsume = amqpChanConsume
+		a.amqpChanConsume.Qos(a.nConsumePrefetch, 0, false)
+		a.routesRegistered = false
+		a.consumeHealthy = true
+	}
+
+	a.conn = conn
+
+	if !a.routesRegistered {
+		a.routeCloseSignals.CancelAll()
+		if err := a.startupServer(); err != nil {
+			log.Printf("alaserv: reconcile: route registration incomplete: %s; retrying", err.Error())
+			a.scheduleReconcile()
+			return
+		}
+		a.routesRegistered = true
+		a.registeredConn = conn
+		log.Printf("alaserv: serving %d route(s) on connection %p", len(a.rhs), conn)
+	}
+
+	// Arm close watchers: if the connection or the consume channel dies
+	// (network loss, broker restart, consumer_timeout, ...), re-reconcile.
+	// The generation guard keeps superseded watchers inert.
+	a.consumeGen++
+	gen := a.consumeGen
+	connClose := conn.NotifyClose(make(chan *amqp.Error, 1))
+	chClose := a.amqpChanConsume.NotifyClose(make(chan *amqp.Error, 1))
+	go func() {
+		select {
+		case <-connClose:
+		case <-chClose:
+		}
+		a.ready.Lock()
+		stale := a.consumeGen != gen || a.stopping
+		a.ready.Unlock()
+		if stale {
+			return
+		}
+		a.publishHealthy = false
+		a.consumeHealthy = false
+		a.routesRegistered = false
+		log.Printf("alaserv: connection/channel closed, scheduling reconcile")
+		a.scheduleReconcile()
+	}()
+}
+
+// registerRoutes declares queues, exchanges and bindings, then starts one
+// handler routine per route. Returns the first error encountered, after
+// attempting all routes.
+func (a *AlaServer) registerRoutes() error {
+	var firstErr error
+	for _, rhs := range a.rhs {
+		consumeCh, err := a.registerRoute(*rhs.q, rhs.ess)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			log.Printf("alaserv: failed to register route of queue %s: %s", rhs.q.Name, err.Error())
+			continue
+		}
+		go func(rhs routeHandlerSetting) {
+			a.startHandlerRoutine(consumeCh, rhs.handler)
+		}(rhs)
+	}
+	return firstErr
 }
 
 // Route register a new route for new handler.
@@ -217,61 +387,79 @@ func (a *AlaServer) startHandlerRoutine(consumeCh <-chan amqp.Delivery, handler 
 }
 
 // startupServer starts server and fires up routine for each registered handler.
-func (a *AlaServer) startupServer() {
+func (a *AlaServer) startupServer() error {
+	var firstErr error
 	for _, rhs := range a.rhs {
 		consumeCh, err := a.registerRoute(*rhs.q, rhs.ess)
 		if err != nil {
-			log.Panicf("failed to register route: %s", err.Error())
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue // keep registering the remaining routes
 		}
 		go func(rhs routeHandlerSetting) {
 			a.startHandlerRoutine(consumeCh, rhs.handler)
 		}(rhs)
 	}
+	return firstErr
 }
 
 // Start starts a Ala AMQP Server for this service.
 func (a *AlaServer) Start(ctx context.Context) {
 	a.ready.Lock()
-	if a.conn == nil {
-		conn, err := amqp.Dial(a.amqpURI)
-		if err != nil {
-			log.Panicf("Failed to start server: %s", err.Error())
-		}
-		a.conn = conn
 
-		amqpChan, err := conn.Channel()
-		if err != nil {
-			log.Panicf("Failed to create channel: %s", err.Error())
-		}
-		a.amqpChan = amqpChan
-
-		amqpChanConsume, err := conn.Channel()
-		if err != nil {
-			log.Panicf("Failed to create channel: %s", err.Error())
-		}
-		a.amqpChanConsume = amqpChanConsume
-		a.amqpChanConsume.Qos(a.nConsumePrefetch, 0, false)
-	}
-
+	// FIX(nil-ctx): set the server context BEFORE any route registration so
+	// handler goroutines never derive from a nil parent context.
 	serverCtx, cancel := context.WithCancel(ctx)
 	a.ctx = serverCtx
 	a.closeSignal = cancel
 
-	a.startupServer()
-	a.printLogo()
+	if a.conn == nil {
+		// Fail fast on unrecoverable configuration errors (bad URI, wrong
+		// credentials), but tolerate a broker that is merely not up yet:
+		// retry a few times before treating it as fatal.
+		var conn *amqp.Connection
+		var dialErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			conn, dialErr = amqp.Dial(a.amqpURI)
+			if dialErr == nil {
+				break
+			}
+			log.Printf("alaserv: failed to dial %s (attempt %d/3): %s", a.amqpURI, attempt, dialErr.Error())
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+		if dialErr != nil {
+			log.Panicf("alaserv: failed to start server: %s", dialErr.Error())
+		}
+		a.conn = conn
+	}
+
 	a.ready.Unlock()
+
+	// Reconcile performs channel creation + route registration (idempotent).
+	a.reconcile(a.conn)
+	a.printLogo()
+
 	<-serverCtx.Done()
 }
 
 // Close closes connection and release the server loop.
 func (a *AlaServer) Close() error {
-	defer a.closeSignal()
+	a.ready.Lock()
+	a.stopping = true
+	closeSignal := a.closeSignal
+	conn := a.conn
+	a.ready.Unlock()
+
+	if closeSignal != nil {
+		defer closeSignal()
+	}
 
 	a.routeCloseSignals.CancelAll()
 	a.closeConnectionMonitorRoutine()
 
-	if a.c == nil {
-		return a.conn.Close()
+	if a.c == nil && conn != nil {
+		return conn.Close()
 	}
 
 	return nil

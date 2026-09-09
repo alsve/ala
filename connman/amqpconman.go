@@ -2,6 +2,7 @@ package connman
 
 import (
 	"sync"
+	"time"
 
 	"github.com/alsve/ala/logger"
 
@@ -47,6 +48,7 @@ type AMQPConnectionManager struct {
 
 // startConnectionMonitorRoutine starts connection monitor routine.
 func (a *AMQPConnectionManager) startConnectionMonitorRoutine() {
+	backoff := time.Second
 	for {
 		select {
 		case <-a.routineCloser:
@@ -59,19 +61,62 @@ func (a *AMQPConnectionManager) startConnectionMonitorRoutine() {
 			}
 			a.log.Info("AMQPConnectionManager.startConnectionMonitorRoutine: reconnecting to AMQP Message Broker.")
 			a.conn = nil
+			a.cond.L.Unlock()
 
-			conn, err := amqp.Dial(a.amqpURI)
-			if err != nil {
-				a.log.Error("AMQPConnectionManager.startConnectionMonitorRoutine: %s", err.Error())
-				continue
+			// FIX(retry-loop): previously a failed dial left cond.L locked and
+			// waited for a *new* close notification that never comes, so the
+			// manager stayed dead forever after a single transient failure.
+			// Now: retry with bounded backoff until the broker is reachable.
+			var conn *amqp.Connection
+			for {
+				c, err := amqp.Dial(a.amqpURI)
+				if err == nil {
+					conn = c
+					break
+				}
+				a.log.Error("AMQPConnectionManager.startConnectionMonitorRoutine: dial failed: %s; retrying in %s", err.Error(), backoff)
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
 			}
+			backoff = time.Second
+
 			if a.autoReconnect {
-				conn.NotifyClose(a.reconnectSignal)
+				// FIX(shared-close-chan): registering the same channel on every
+				// connection makes streadway close it after the first
+				// notification, panicing ("send on closed channel") on the
+				// next connection loss. Use a per-connection receiver and
+				// forward the event without dropping reconnect machinery.
+				closeCh := make(chan *amqp.Error, 1)
+				conn.NotifyClose(closeCh)
+				go func(closer chan *amqp.Error) {
+					amErr, ok := <-closer
+					if !ok {
+						return
+					}
+					select {
+					case a.reconnectSignal <- amErr:
+					default:
+					}
+				}(closeCh)
 			}
 
+			a.cond.L.Lock()
 			a.conn = conn
 			a.cond.L.Unlock()
 			a.cond.Broadcast()
+
+			// Coalesce bursts of queued reconnect signals so a flood of waiters
+			// cannot trigger one dial per signal.
+		drain:
+			for {
+				select {
+				case <-a.reconnectSignal:
+				default:
+					break drain
+				}
+			}
 
 			for _, ch := range a.tpReconnSignal {
 				select {
