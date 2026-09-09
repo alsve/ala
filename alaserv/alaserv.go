@@ -160,9 +160,16 @@ func (a *AlaServer) SetConnector(c Connector) {
 func (a *AlaServer) SetReconnectSignal(c ReconnectSignaler) {
 	a.ready.Lock()
 	defer a.ready.Unlock()
+
 	a.reconnectSignal = c.ReconnectSignal()
 
-	a.closeConnectionMonitorRoutine()
+	// FIX(reconcile-loop-kill): this used to call closeConnectionMonitorRoutine(),
+	// which was an accidental no-op while cmrCloser was an uninitialized nil
+	// channel. Once the channel became real, this call STOPPED the reconcile
+	// loop at wiring time — every later recovery trigger (connection close,
+	// consume-channel close, scheduled reconcile) was then swallowed forever
+	// and the server could never recover from a broker-side close.
+	// _ = a.closeConnectionMonitorRoutine() — intentionally removed.
 }
 
 // closeConnectionMonitorRoutine closes connection monitor routine.
