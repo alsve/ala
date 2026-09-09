@@ -144,6 +144,14 @@ func (a *AMQPConnectionManager) startConnectionMonitorRoutine() {
 
 // ReconnectSignal creates listener to reconnection.
 func (a *AMQPConnectionManager) ReconnectSignal() <-chan *amqp.Connection {
+	// FIX(typed-nil): tolerate a typed-nil receiver so callers wiring the
+	// manager as an alaserv Connector before it is assigned cannot panic.
+	// A nil channel blocks forever, which is the correct "never fires"
+	// semantics for a select-based receiver.
+	if a == nil {
+		return nil
+	}
+
 	tpCh := make(chan *amqp.Connection)
 	a.tpReconnSignal = append(a.tpReconnSignal, tpCh)
 	return tpCh
@@ -151,6 +159,11 @@ func (a *AMQPConnectionManager) ReconnectSignal() <-chan *amqp.Connection {
 
 // Connect connects service to AMQP message broker.
 func (a *AMQPConnectionManager) Connect() *amqp.Connection {
+	// FIX(typed-nil): tolerate a typed-nil receiver (see package tests).
+	if a == nil {
+		return nil
+	}
+
 	a.cond.L.Lock()
 	defer a.cond.L.Unlock()
 
@@ -172,7 +185,9 @@ func (a *AMQPConnectionManager) Connect() *amqp.Connection {
 
 // RenewAMQPChannel renew channel from a connection.
 func (a *AMQPConnectionManager) RenewAMQPChannel() (*amqp.Channel, error) {
-	a.Connect()
+	if a == nil || a.Connect() == nil {
+		return nil, ErrChannelCreationFailed
+	}
 
 	ch, err := a.conn.Channel()
 	if err != nil {
@@ -191,7 +206,11 @@ func (a *AMQPConnectionManager) Close() error {
 	a.routineCloser <- struct{}{}
 
 	for _, ch := range a.tpReconnSignal {
-		close(ch)
+		// FIX(send-on-closed): closing these channels made any in-flight
+		// forwarder goroutine panic with "send on closed channel" when a
+		// connection drop raced with Close. Receivers unblock through their
+		// own close signals (e.g. alaserv's cmrCloser), so just drop them.
+		_ = ch
 	}
 
 	a.tpReconnSignal = nil

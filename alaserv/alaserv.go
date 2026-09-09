@@ -107,6 +107,12 @@ type AlaServer struct {
 	publishHealthy   bool
 	consumeHealthy   bool
 
+	// ownConn is a connection this server dialed itself (no Connector, or
+	// Connector had no connection yet). Once the Connector provides a
+	// connection, the owned one is abandoned — close it there and in Close
+	// so a start never leaks an idle connection on the broker.
+	ownConn *amqp.Connection
+
 	// stopping guards Close() vs reconcile races.
 	stopping bool
 }
@@ -266,6 +272,14 @@ func (a *AlaServer) reconcile(pushConn *amqp.Connection) {
 
 	a.conn = conn
 
+	// FIX(ownConn-leak): once the Connector provides a connection, the
+	// self-dialed one from Start is abandoned — close it so a start never
+	// leaks an idle connection on the broker (one per Start/reload before).
+	if a.ownConn != nil && a.ownConn != a.conn {
+		_ = a.ownConn.Close()
+		a.ownConn = nil
+	}
+
 	if !a.routesRegistered {
 		a.routeCloseSignals.CancelAll()
 		if err := a.startupServer(); err != nil {
@@ -420,21 +434,13 @@ func (a *AlaServer) Start(ctx context.Context) {
 	a.closeSignal = cancel
 
 	if a.conn == nil {
-		// Prefer the Connector's connection: dialing a second connection here
-		// leaks it, because reconcile() replaces a.conn with the Connector's
-		// connection right after startup, leaving the dialed one orphaned
-		// (one idle AMQP connection per Start/reload on the broker).
-		if a.c != nil {
-			if pulled := a.c.Connect(); pulled != nil {
-				a.conn = pulled
-			}
-		}
-	}
-
-	if a.conn == nil {
 		// Fail fast on unrecoverable configuration errors (bad URI, wrong
 		// credentials), but tolerate a broker that is merely not up yet:
-		// retry a few times before treating it as fatal.
+		// retry a few times before treating it as fatal. NOTE: intentionally
+		// NOT pulling from the Connector here — Connect() may block for a long
+		// time on an unreachable broker while this method holds the ready
+		// lock. reconcile() adopts the Connector's connection as soon as one
+		// exists and closes this self-dialed one (ownConn).
 		var conn *amqp.Connection
 		var dialErr error
 		for attempt := 1; attempt <= 3; attempt++ {
@@ -446,9 +452,16 @@ func (a *AlaServer) Start(ctx context.Context) {
 			time.Sleep(time.Duration(attempt) * 2 * time.Second)
 		}
 		if dialErr != nil {
+			// FIX(panic-with-lock): log.Panicf used to unwind while still
+			// holding the ready lock, so any later Close() on this server
+			// spun forever on it. Mark the server as stopping and release
+			// the lock before panicking.
+			a.stopping = true
+			a.ready.Unlock()
 			log.Panicf("alaserv: failed to start server: %s", dialErr.Error())
 		}
 		a.conn = conn
+		a.ownConn = conn
 	}
 
 	a.ready.Unlock()
@@ -467,6 +480,7 @@ func (a *AlaServer) Close() error {
 	closeSignal := a.closeSignal
 	publishCh := a.amqpChan
 	consumeCh := a.amqpChanConsume
+	ownConn := a.ownConn
 	conn := a.conn
 	a.ready.Unlock()
 
@@ -484,6 +498,12 @@ func (a *AlaServer) Close() error {
 	}
 	if publishCh != nil {
 		_ = publishCh.Close()
+	}
+
+	// Close a still-owned self-dialed connection (the Connector-owned
+	// connection is closed by its owner).
+	if ownConn != nil {
+		_ = ownConn.Close()
 	}
 
 	a.routeCloseSignals.CancelAll()
