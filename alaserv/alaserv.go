@@ -16,6 +16,16 @@ type Publisher interface {
 	Publish(exchange, key string, mandatory, immediate bool, msg amqp.Publishing) error
 }
 
+// Reconcile retry backoff bounds. A failed reconcile pass (channel creation
+// or route registration) used to schedule the next pass immediately, so a
+// persistent failure spun the loop hundreds of times per second — flooding
+// logs and hammering the broker with RPCs. Retries now wait
+// reconcileRetryBase, doubling up to reconcileRetryMax.
+const (
+	reconcileRetryBase = 500 * time.Millisecond
+	reconcileRetryMax  = 30 * time.Second
+)
+
 // Replyer shall connect correlation id to listener.
 type Replyer interface {
 	Reply(correlationID string, data amqp.Delivery) error
@@ -97,6 +107,11 @@ type AlaServer struct {
 
 	// reconcileCh coalesces recovery triggers; reconcileLoop serializes them.
 	reconcileCh chan struct{}
+
+	// retryAttempt counts consecutive failed reconcile passes so failure
+	// retries back off exponentially instead of spinning in a hot loop.
+	// Guarded by the ready lock (reconcile passes are serialized under it).
+	retryAttempt int
 
 	// registeredConn/routesRegistered track whether consumers are live on
 	// the current connection+channel pair, so reconcile() never registers
@@ -203,6 +218,19 @@ func (a *AlaServer) scheduleReconcile() {
 	}
 }
 
+// retryWithBackoff schedules the next reconcile retry after an exponential
+// backoff. Only failure paths use it; fresh triggers (connection close,
+// reconnect push) still reconcile immediately via scheduleReconcile.
+func (a *AlaServer) retryWithBackoff() {
+	a.retryAttempt++
+	backoff := reconcileRetryBase << uint(a.retryAttempt)
+	// backoff <= 0 guards shift overflow after many consecutive failures.
+	if backoff > reconcileRetryMax || backoff <= 0 {
+		backoff = reconcileRetryMax
+	}
+	time.AfterFunc(backoff, a.scheduleReconcile)
+}
+
 // reconcile (re)establishes channels and route registrations against the
 // freshest available connection. It is the single recovery path for:
 //   - Connector reconnect pushes,
@@ -252,7 +280,7 @@ func (a *AlaServer) reconcile(pushConn *amqp.Connection) {
 		amqpChan, err := conn.Channel()
 		if err != nil {
 			log.Printf("alaserv: reconcile: failed to create publish channel: %s; retrying", err.Error())
-			a.scheduleReconcile()
+			a.retryWithBackoff()
 			return
 		}
 		a.amqpChan = amqpChan
@@ -268,7 +296,7 @@ func (a *AlaServer) reconcile(pushConn *amqp.Connection) {
 		amqpChanConsume, err := conn.Channel()
 		if err != nil {
 			log.Printf("alaserv: reconcile: failed to create consume channel: %s; retrying", err.Error())
-			a.scheduleReconcile()
+			a.retryWithBackoff()
 			return
 		}
 		a.amqpChanConsume = amqpChanConsume
@@ -291,11 +319,22 @@ func (a *AlaServer) reconcile(pushConn *amqp.Connection) {
 		a.routeCloseSignals.CancelAll()
 		if err := a.startupServer(); err != nil {
 			log.Printf("alaserv: reconcile: route registration incomplete: %s; retrying", err.Error())
-			a.scheduleReconcile()
+			// FIX(stale-healthy-after-failed-registration): the freshly created
+			// channels get their close-watcher armed only AFTER a successful
+			// registration. If registration failed and one of those channels
+			// later died (broker closed the consume channel, connection blip),
+			// the healthy flags stayed true and every subsequent pass skipped
+			// channel recreation — reconciling forever on a dead channel with
+			// client-side ErrClosed (504) and never recovering. Mark both
+			// channels unhealthy so the next pass recreates them.
+			a.publishHealthy = false
+			a.consumeHealthy = false
+			a.retryWithBackoff()
 			return
 		}
 		a.routesRegistered = true
 		a.registeredConn = conn
+		a.retryAttempt = 0 // success: next failure starts from the base backoff
 		log.Printf("alaserv: serving %d route(s) on connection %p", len(a.rhs), conn)
 	}
 
